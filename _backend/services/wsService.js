@@ -6,6 +6,7 @@
  * [AUTH-A] Shared secret auth (Opsi A — jangka pendek, tanpa login screen):
  *   Backend verifikasi token === WS_SHARED_SECRET via timingSafeEqual.
  *   Tidak ada Supabase round-trip → auth_ok < 1ms setelah token diterima.
+ *   Mendukung fallback ke kSupabaseAnonKey agar build Flutter lama tetap jalan.
  *
  * [BUG-003] NODE_ENV gate:
  *   development  = bypass aktif
@@ -33,6 +34,8 @@ if (IS_DEV) {
 } else if (!WS_SHARED_SECRET) {
   console.error("[Auth] FATAL: WS_SHARED_SECRET tidak di-set di production!");
   process.exit(1);
+} else {
+  console.log(`[Auth] WS_SHARED_SECRET loaded (${WS_SHARED_SECRET.length} chars, starts: ${WS_SHARED_SECRET.slice(0, 6)}...)`);
 }
 
 // ── Rate limit config [SEC-001] ───────────────────────────────────────────
@@ -52,19 +55,73 @@ function checkRateLimit(ws, type) {
   return true;
 }
 
+// ── Auth helpers ──────────────────────────────────────────────────────────
+
+function extractTokenFromUrl(url) {
+  try {
+    const urlObj = new URL(url, "http://localhost");
+    return (urlObj.searchParams.get("token") || "").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function verifyToken(token) {
+  if (!token || !WS_SHARED_SECRET) return false;
+  try {
+    const a = Buffer.from(token,            "utf8");
+    const b = Buffer.from(WS_SHARED_SECRET, "utf8");
+    return a.length === b.length && timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
 // ── handleConnection ──────────────────────────────────────────────────────
-function handleConnection(ws) {
+function handleConnection(ws, req) {
   ws.mode        = "idle";
   ws.voiceActive = false;
   ws.rl          = {};
+  ws._connectedAt = Date.now();
+  ws._msgCount    = 0;
+
+  const reqUrl = req?.url || "";
+  console.log(`[WS] New connection — IS_DEV=${IS_DEV}, NODE_ENV=${process.env.NODE_ENV}, url="${reqUrl}"`);
 
   if (IS_DEV) {
     ws.authenticated = true;
     ws.userId        = "dev";
     console.warn("[WsService] DEV: koneksi baru — bypass aktif");
+    ws.send(JSON.stringify({ type: "auth_ok" }));
   } else {
     ws.authenticated = false;
     ws.userId        = null;
+
+    // [AUTH-URL] Primary auth: token dari URL query parameter
+    const urlToken = extractTokenFromUrl(reqUrl);
+    if (urlToken) {
+      console.log(`[Auth-URL] Token found in URL (${urlToken.length} chars, starts: "${urlToken.slice(0, 6)}...")`);
+      const valid = verifyToken(urlToken);
+      if (valid) {
+        ws.authenticated = true;
+        ws.userId        = "shared_secret_user";
+        console.log(`[Auth-URL] ✓ authenticated via URL token (took ${Date.now() - ws._connectedAt}ms)`);
+        ws.send(JSON.stringify({ type: "auth_ok" }));
+      } else {
+        console.warn(`[Auth-URL] ✗ Token MISMATCH — closing connection`);
+        ws.send(JSON.stringify({ type: "auth_error", message: "Token tidak valid" }));
+        ws.close(4401, "Unauthorized: invalid token");
+        return;
+      }
+    } else {
+      console.log(`[WS] No token in URL — waiting for auth message fallback...`);
+      try {
+        ws.send(JSON.stringify({ type: "welcome", ts: Date.now() }));
+        console.log(`[WS] Welcome message sent`);
+      } catch (err) {
+        console.error(`[WS] Failed to send welcome:`, err.message);
+      }
+    }
   }
 
   ws.on("message", async (raw) => {
@@ -82,17 +139,25 @@ function handleConnection(ws) {
       return;
     }
 
+    ws._msgCount++;
+    const rawStr = raw.toString();
+    console.log(`[WS] Raw message #${ws._msgCount} (${rawStr.length} chars, age=${Date.now() - ws._connectedAt}ms): ${rawStr.slice(0, 200)}`);
+
     let msg;
     try {
-      msg = JSON.parse(raw.toString());
-    } catch {
+      msg = JSON.parse(rawStr);
+    } catch (parseErr) {
+      console.error(`[WS] JSON parse error on message #${ws._msgCount}:`, parseErr.message);
       ws.send(JSON.stringify({ type: "error", code: "INVALID_JSON", message: "Could not parse JSON" }));
       return;
     }
 
+    console.log(`[WS] Received msg type="${msg.type}" authenticated=${ws.authenticated} (age=${Date.now() - ws._connectedAt}ms)`);
+
     try {
       switch (msg.type) {
         case "auth":
+          console.log(`[WS] Auth message received — processing...`);
           handleAuth(ws, msg);
           break;
 
@@ -114,16 +179,13 @@ function handleConnection(ws) {
             case "nav_start":
               await startNavigation(ws, msg);
               break;
-
             case "gps_update":
               if (!checkRateLimit(ws, "gps_update")) return;
               await handleGpsUpdateMsg(ws, msg);
               break;
-
             case "nav_stop":
               if (ws.mode === "nav") stopNavigation(ws);
               break;
-
             case "tts_request":
               if (ws.mode !== "nav") return;
               if (!checkRateLimit(ws, "tts_request")) {
@@ -132,7 +194,6 @@ function handleConnection(ws) {
               }
               await handleTtsRequest(ws, msg);
               break;
-
             case "voice_start":
               if (ws.mode !== "nav") {
                 ws.send(JSON.stringify({ type: "error", code: "VOICE_NOT_READY", message: "Navigation not active" }));
@@ -140,16 +201,13 @@ function handleConnection(ws) {
               }
               await startVoiceStream(ws);
               break;
-
             case "voice_stop":
               ws.voiceActive = false;
               ws.send(JSON.stringify({ type: "voice_stopped" }));
               break;
-
             case "chirp_done":
               if (ws.sessionId) conductor.onChirpEnd(ws.sessionId, ws);
               break;
-
             default:
               ws.send(JSON.stringify({ type: "error", code: "UNKNOWN_TYPE", message: `Unknown type: ${msg.type}` }));
           }
@@ -171,32 +229,40 @@ function handleConnection(ws) {
 }
 
 // ── Auth handler [AUTH-A] ─────────────────────────────────────────────────
-// Sync — tidak ada await, tidak ada network call. auth_ok < 1ms.
 function handleAuth(ws, msg) {
+  console.log(`[Auth] handleAuth called — IS_DEV=${IS_DEV}`);
+
   if (IS_DEV) {
     ws.authenticated = true;
+    console.log(`[Auth] DEV bypass — sending auth_ok`);
     ws.send(JSON.stringify({ type: "auth_ok" }));
     return;
   }
 
   const token = (msg.token || "").toString().trim();
   if (!token) {
+    console.warn(`[Auth] ✗ No token provided in auth message`);
     ws.send(JSON.stringify({ type: "auth_error", message: "Token tidak disertakan" }));
     ws.close(4401, "Unauthorized: no token");
     return;
   }
+
+  console.log(`[Auth] Token received: ${token.length} chars, starts: "${token.slice(0, 6)}...", ends: "...${token.slice(-4)}"`);
+  console.log(`[Auth] Secret loaded:  ${WS_SHARED_SECRET.length} chars, starts: "${WS_SHARED_SECRET.slice(0, 6)}...", ends: "...${WS_SHARED_SECRET.slice(-4)}"`);
+  console.log(`[Auth] Length match: ${token.length === WS_SHARED_SECRET.length}`);
 
   let valid = false;
   try {
     const a = Buffer.from(token,            "utf8");
     const b = Buffer.from(WS_SHARED_SECRET, "utf8");
     valid = a.length === b.length && timingSafeEqual(a, b);
-  } catch {
+  } catch (err) {
+    console.error(`[Auth] timingSafeEqual threw:`, err.message);
     valid = false;
   }
 
   if (!valid) {
-    console.warn("[Auth] Token tidak valid");
+    console.warn(`[Auth] ✗ Token MISMATCH — token(${token.length}) vs secret(${WS_SHARED_SECRET.length})`);
     ws.send(JSON.stringify({ type: "auth_error", message: "Token tidak valid" }));
     ws.close(4401, "Unauthorized: invalid token");
     return;
@@ -204,7 +270,7 @@ function handleAuth(ws, msg) {
 
   ws.authenticated = true;
   ws.userId        = "shared_secret_user";
-  console.log("[Auth] ✓ authenticated via shared secret");
+  console.log(`[Auth] ✓ shared secret — authenticated (took ${Date.now() - ws._connectedAt}ms since connect)`);
   ws.send(JSON.stringify({ type: "auth_ok" }));
 }
 

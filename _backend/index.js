@@ -24,7 +24,7 @@ function createServer() {
   });
 
   const wss = new WebSocketServer({ server });
-  wss.on("connection", (ws) => handleConnection(ws));
+  wss.on("connection", (ws, req) => handleConnection(ws, req));
 
   return server;
 }
