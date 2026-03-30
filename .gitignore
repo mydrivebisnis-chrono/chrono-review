@@ -1,0 +1,27 @@
+# Flutter
+_frontend/lib/config/constants.dart
+_frontend/.dart_tool/
+_frontend/.flutter-plugins
+_frontend/.flutter-plugins-dependencies
+_frontend/build/
+_frontend/.packages
+_frontend/pubspec.lock
+
+# Backend
+_backend/.env
+_backend/node_modules/
+_backend/*.log
+
+# GCP credentials
+*.json
+!_backend/package.json
+!_backend/eslint.config.js
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
