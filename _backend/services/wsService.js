@@ -3,24 +3,42 @@
 /**
  * wsService.js — WebSocket message router
  *
- * [BUG-003] Auth: NODE_ENV-gated. Development = bypass, production = Supabase JWT.
- * [SEC-001] Rate limiting per koneksi (token bucket ringan, tanpa library):
- *   - tts_request : min interval 3000ms  — Chirp 3 HD cost protection
- *   - gps_update  : min interval 800ms   — debounce (frontend juga throttle)
- *   Implementasi: catat lastAllowedMs per type di object ws.rl.
+ * [AUTH-A] Shared secret auth (Opsi A — jangka pendek, tanpa login screen):
+ *   Backend verifikasi token === WS_SHARED_SECRET via timingSafeEqual.
+ *   Tidak ada Supabase round-trip → auth_ok < 1ms setelah token diterima.
+ *
+ * [BUG-003] NODE_ENV gate:
+ *   development  = bypass aktif
+ *   production   = wajib kirim WS_SHARED_SECRET
+ *
+ * [SEC-001] Rate limiting per koneksi (tanpa library):
+ *   tts_request : min 3000ms
+ *   gps_update  : min 800ms
  */
 
-const { createClient }      = require("@supabase/supabase-js");
-const { getRoute }          = require("./routeService");
-const { processGpsUpdate }  = require("./navService");
-const { synthNavTts }       = require("./ttsService");
-const geminiService         = require("./geminiService");
-const conductor             = require("./conductor");
+const { timingSafeEqual } = require("crypto");
+const { getRoute }        = require("./routeService");
+const { processGpsUpdate } = require("./navService");
+const { synthNavTts }     = require("./ttsService");
+const geminiService       = require("./geminiService");
+const conductor           = require("./conductor");
 
-// ── Rate limit config [SEC-001] ──────────────────────────────────────────────
+// ── Shared secret [AUTH-A] ────────────────────────────────────────────────
+const WS_SHARED_SECRET = (process.env.WS_SHARED_SECRET || "").trim();
+
+const IS_DEV = process.env.NODE_ENV === "development";
+
+if (IS_DEV) {
+  console.warn("\x1b[31m%s\x1b[0m", "[WsService] 🔴 DEV AUTH BYPASS AKTIF");
+} else if (!WS_SHARED_SECRET) {
+  console.error("[Auth] FATAL: WS_SHARED_SECRET tidak di-set di production!");
+  process.exit(1);
+}
+
+// ── Rate limit config [SEC-001] ───────────────────────────────────────────
 const RL = {
-  tts_request: 3000,  // ms — min interval antar tts_request per koneksi
-  gps_update:   800,  // ms — min interval antar gps_update per koneksi
+  tts_request: 3000,
+  gps_update:   800,
 };
 
 function checkRateLimit(ws, type) {
@@ -34,35 +52,16 @@ function checkRateLimit(ws, type) {
   return true;
 }
 
-// ── Supabase Admin ──────────────────────────────────────────────────────
-let supabaseAdmin = null;
-if (process.env.NODE_ENV !== "development") {
-  const supabaseUrl        = process.env.SUPABASE_URL;
-  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!supabaseUrl || !supabaseServiceKey) {
-    console.error("[Auth] FATAL: SUPABASE_URL atau SUPABASE_SERVICE_ROLE_KEY tidak di-set!");
-    process.exit(1);
-  }
-  supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
-}
-
-const IS_DEV = process.env.NODE_ENV === "development";
-if (IS_DEV) {
-  console.warn("\x1b[31m%s\x1b[0m", "[WsService] 🔴 DEV AUTH BYPASS AKTIF");
-}
-
-// ── handleConnection ────────────────────────────────────────────────────
+// ── handleConnection ──────────────────────────────────────────────────────
 function handleConnection(ws) {
   ws.mode        = "idle";
   ws.voiceActive = false;
-  ws.rl          = {};   // [SEC-001] rate limit state
+  ws.rl          = {};
 
   if (IS_DEV) {
     ws.authenticated = true;
     ws.userId        = "dev";
-    console.warn("[WsService] DEV: koneksi baru — authenticated=true (bypass)");
+    console.warn("[WsService] DEV: koneksi baru — bypass aktif");
   } else {
     ws.authenticated = false;
     ws.userId        = null;
@@ -94,7 +93,7 @@ function handleConnection(ws) {
     try {
       switch (msg.type) {
         case "auth":
-          await handleAuth(ws, msg);
+          handleAuth(ws, msg);
           break;
 
         case "ping":
@@ -106,7 +105,7 @@ function handleConnection(ws) {
             ws.send(JSON.stringify({
               type:    "error",
               code:    "UNAUTHORIZED",
-              message: "Kirim { type: 'auth', token: '<jwt>' } terlebih dahulu",
+              message: "Kirim { type: 'auth', token: '<shared_secret>' } terlebih dahulu",
             }));
             return;
           }
@@ -128,7 +127,7 @@ function handleConnection(ws) {
             case "tts_request":
               if (ws.mode !== "nav") return;
               if (!checkRateLimit(ws, "tts_request")) {
-                console.log(`[TTS] Rate limited — drop ${(msg.request_id || '').toString()}`);
+                console.log(`[TTS] Rate limited — drop ${(msg.request_id || "").toString()}`);
                 return;
               }
               await handleTtsRequest(ws, msg);
@@ -171,39 +170,45 @@ function handleConnection(ws) {
   });
 }
 
-// ── Auth [BUG-003] ────────────────────────────────────────────────────
-async function handleAuth(ws, msg) {
+// ── Auth handler [AUTH-A] ─────────────────────────────────────────────────
+// Sync — tidak ada await, tidak ada network call. auth_ok < 1ms.
+function handleAuth(ws, msg) {
   if (IS_DEV) {
+    ws.authenticated = true;
     ws.send(JSON.stringify({ type: "auth_ok" }));
     return;
   }
+
   const token = (msg.token || "").toString().trim();
   if (!token) {
     ws.send(JSON.stringify({ type: "auth_error", message: "Token tidak disertakan" }));
     ws.close(4401, "Unauthorized: no token");
     return;
   }
+
+  let valid = false;
   try {
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
-    if (error || !data?.user) {
-      const reason = error?.message || "Token tidak valid";
-      console.warn(`[Auth] Gagal verifikasi token: ${reason}`);
-      ws.send(JSON.stringify({ type: "auth_error", message: reason }));
-      ws.close(4401, "Unauthorized: invalid token");
-      return;
-    }
-    ws.authenticated = true;
-    ws.userId        = data.user.id;
-    console.log(`[Auth] User authenticated: ${ws.userId}`);
-    ws.send(JSON.stringify({ type: "auth_ok" }));
-  } catch (err) {
-    console.error("[Auth] Supabase error:", err.message);
-    ws.send(JSON.stringify({ type: "auth_error", message: "Auth service error" }));
-    ws.close(4401, "Unauthorized: auth service error");
+    const a = Buffer.from(token,            "utf8");
+    const b = Buffer.from(WS_SHARED_SECRET, "utf8");
+    valid = a.length === b.length && timingSafeEqual(a, b);
+  } catch {
+    valid = false;
   }
+
+  if (!valid) {
+    console.warn("[Auth] Token tidak valid");
+    ws.send(JSON.stringify({ type: "auth_error", message: "Token tidak valid" }));
+    ws.close(4401, "Unauthorized: invalid token");
+    return;
+  }
+
+  ws.authenticated = true;
+  ws.userId        = "shared_secret_user";
+  console.log("[Auth] ✓ authenticated via shared secret");
+  ws.send(JSON.stringify({ type: "auth_ok" }));
 }
 
-// ── Navigation ────────────────────────────────────────────────────────
+// ── Navigation ────────────────────────────────────────────────────────────
 async function startNavigation(ws, msg) {
   const { destination, dest_lat, dest_lng, origin_lat, origin_lng } = msg;
   const sessionId = `nav_${Date.now().toString(36)}`;
@@ -288,7 +293,6 @@ async function handleGpsUpdateMsg(ws, msg) {
   if (payload) ws.send(JSON.stringify(payload));
 }
 
-// ── TTS on-demand (Model A) ───────────────────────────────────────
 async function handleTtsRequest(ws, msg) {
   const text      = (msg.text      || "").trim();
   const requestId = (msg.request_id || "").toString();
@@ -321,7 +325,6 @@ async function handleTtsRequest(ws, msg) {
   }
 }
 
-// ── Gemini Live (Phase 3) ───────────────────────────────────────
 async function startVoiceStream(ws) {
   ws.voiceActive = true;
   ws.send(JSON.stringify({ type: "voice_ready", session_id: ws.sessionId }));
@@ -355,7 +358,6 @@ async function startVoiceStream(ws) {
   });
 }
 
-// ── Helpers ───────────────────────────────────────────────────────
 function stopNavigation(ws) {
   if (ws.trafficTimer) {
     clearInterval(ws.trafficTimer);
