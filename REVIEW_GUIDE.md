@@ -19,57 +19,80 @@ Arsitektur utama: **2 engine terpisah dalam 1 APK**.
 
 ---
 
+## Bug Resolved
+
+### ✅ BUG-001 — WebSocket Timeout saat Mulai Navigasi
+**Status:** RESOLVED
+**Fix:** Split timeout menjadi dua phase (handshake 8s + auth_ok 18s) + retry 1x otomatis.
+
+### ✅ BUG-002 — Race Condition Double-call connect()
+**Status:** RESOLVED
+**Fix:** Flag `_isConnecting` sebagai guard di `ws_service.dart`.
+
+### ✅ BUG-003 — DEV BYPASS Auth di Backend
+**Status:** RESOLVED
+**Fix:** Ganti hardcoded bypass dengan `WS_SHARED_SECRET` via `timingSafeEqual`.
+
+### ✅ AUTH-A — Shared Secret Auth (Supabase round-trip)
+**Status:** RESOLVED
+**Fix:** `supabaseAdmin.auth.getUser()` diganti constant-time compare terhadap `WS_SHARED_SECRET`.
+
+### ✅ AUTH-URL — Cloud Run Tidak Teruskan WS Data Frames
+**Status:** RESOLVED
+**Root Cause:** Cloud Run proxy tidak meneruskan WebSocket data frames client→server setelah HTTP upgrade. Token auth yang dikirim via `sink.add()` tidak pernah sampai ke backend.
+**Fix:** Token dikirim sebagai `?token=` query parameter di URL saat HTTP upgrade request. Backend baca token dari `req.url` di `handleConnection(ws, req)` — auth selesai sebelum frame pertama.
+
+---
+
 ## Bug Aktif — Perlu Review
 
-### 🔴 BUG-001 — WebSocket Timeout saat Mulai Navigasi
-**Files:** `_frontend/lib/screens/home_screen.dart` + `_frontend/lib/services/ws_service.dart`
+### 🔴 BUG-004 — Lokasi User Tidak Terdeteksi
+**Files:** `_frontend/lib/services/gps_service.dart`, `_frontend/lib/screens/home_screen.dart`
 
-**Gejala:** User tekan "Mulai Navigasi" → warning "Koneksi ke server timeout".
+**Gejala:** Kamera map stuck di posisi center (default), tidak mengikuti lokasi user. `getCurrentPosition()` tidak return atau terlambat.
 
 **Hipotesis:**
-1. Timeout 10 detik terlalu pendek — Cloud Run cold start bisa 5–15 detik
-2. `connect()` di `ws_service.dart` melakukan WS handshake DAN menunggu `auth_ok` dalam satu future — kalau salah satu lambat, keduanya timeout bersama
-3. Error path di `home_screen.dart` tidak selalu `return` setelah catch, berpotensi lanjut ke `sendNavStart` meski koneksi gagal
+1. Permission GPS belum di-grant atau diminta tapi tidak ditunggu dengan benar sebelum `connect()` dipanggil
+2. `Geolocator.getCurrentPosition()` timeout di device tertentu tanpa fallback
+3. `origin_lat / origin_lng` yang dikirim di `nav_start` kemungkinan `null` atau `0.0` — Routes API gagal tapi error tidak ditampilkan ke UI
 
 **Yang perlu direview:**
-- Apakah timeout 20 detik cukup atau perlu split (connect vs auth masing-masing punya timeout)?
-- Apakah perlu retry 1x sebelum show error ke user?
-- Apakah `_markDisconnected()` perlu cancel `_authCompleter` yang masih pending?
+- Apakah ada guard yang memastikan lokasi valid sebelum `sendNavStart()` dipanggil?
+- Apakah ada fallback ke `getLastKnownPosition()` jika `getCurrentPosition()` timeout?
 
-### 🟡 BUG-002 — Potensi Race Condition Double-call connect()
-**File:** `_frontend/lib/services/ws_service.dart`
+### 🔴 BUG-005 — Route Tidak Muncul, Status "Menunggu Route" Terus
+**Files:** `_backend/services/routeService.js`, `_frontend/lib/services/navigation_engine.dart`
 
-**Gejala:** User tekan navigasi 2x cepat → `connect()` dipanggil dua kali → dua `_authCompleter` bisa bertabrakan
+**Gejala:** Places API terpanggil (destinasi resolve OK), tapi route tidak pernah muncul. Status UI stuck di "menunggu route". GCP metrics menunjukkan Places API request ada, tapi Routes API tidak terpanggil atau responnya tidak sampai ke Flutter.
 
-**Solusi kandidat:** Tambahkan flag `_isConnecting` sebagai guard di awal `connect()`:
-```dart
-bool _isConnecting = false;
+**Hipotesis:**
+1. `nav_start` dikirim dengan `origin_lat/origin_lng` null/zero (akibat BUG-004) → Routes API gagal → error ditelan di backend tanpa feedback yang jelas ke UI
+2. `nav_started` response dari backend tidak sampai ke Flutter (bidirectional WS masih bermasalah untuk server→client frames tertentu)
+3. `navigation_engine.dart` tidak handle `nav_started` dengan benar jika field tertentu null
 
-Future<void> connect() async {
-  if (_isConnecting || (_wsReady && _authOk)) return;
-  _isConnecting = true;
-  try {
-    // ... existing logic
-  } finally {
-    _isConnecting = false;
-  }
-}
+**Yang perlu direview:**
+- Apakah `routeService.js` mengembalikan error yang informatif jika `origin_lat` null/invalid?
+- Apakah ada validasi koordinat sebelum Routes API dipanggil?
+- Apakah `nav_started` handler di Flutter sudah robust terhadap partial response?
+
+---
+
+## Diagnostic Log (Terpasang)
+
+Log debug aktif di production untuk diagnosa bug di atas:
+
+**Cloud Run (backend):**
+```
+[WS] New connection — IS_DEV=false, url="/?token=..."
+[Auth-URL] ✓ authenticated via URL token
+[WS] Raw message #1 ... {"type":"nav_start",...}   ← konfirmasi bidirectional OK
 ```
 
-### 🟡 BUG-003 — DEV BYPASS Auth di Backend (Perlu Ditandai)
-**File:** `_backend/services/wsService.js` baris ~18
-
-**Issue:** `ws.authenticated = true` hardcoded — auth bypass untuk development.
-Ini **harus dihapus** sebelum production release.
-
-```js
-// SAAT INI (DEV BYPASS — TIDAK AMAN UNTUK PRODUCTION):
-ws.authenticated = true;
-ws.userId = "dev";
-
-// SEHARUSNYA di production:
-// ws.authenticated = false;
-// verifikasi JWT dari Supabase sebelum set authenticated = true
+**Flutter logcat:**
+```
+[WsService] incoming: type=auth_ok
+[WsService] _send type=nav_start (xx chars)
+[WsService] _send OK — sink.add() completed for type=nav_start
 ```
 
 ---
@@ -83,14 +106,14 @@ _frontend/
     config/
       constants.template.dart   ← template (bukan yang asli)
     screens/
-      home_screen.dart          ← entry point navigasi ← FOKUS REVIEW BUG-001
+      home_screen.dart          ← entry point navigasi
       navigation_screen.dart    ← layar saat navigasi aktif
     services/
-      ws_service.dart           ← WebSocket + auth flow ← FOKUS REVIEW BUG-001 & BUG-002
+      ws_service.dart           ← WebSocket + auth flow
       navigation_engine.dart    ← Google Routes, polyline
       gemini_service.dart       ← Gemini Live stream
       geocoding_service.dart    ← Places Autocomplete
-      gps_service.dart          ← GPS permission + stream
+      gps_service.dart          ← GPS permission + stream ← FOKUS BUG-004
       nav_tts_player.dart       ← Chirp 3HD audio
     widgets/
 
@@ -99,10 +122,10 @@ _backend/
   config/
     env.js                      ← semua config dari process.env
   services/
-    wsService.js                ← WebSocket handler ← FOKUS REVIEW BUG-003
+    wsService.js                ← WebSocket handler
     conductor.js                ← Arbiter 2-engine
     geminiService.js            ← Gemini Live + text sessions
-    routeService.js             ← Google Routes API
+    routeService.js             ← Google Routes API ← FOKUS BUG-005
     navService.js               ← TTS level logic
     ttsService.js               ← Chirp 3HD synthesis
 ```
