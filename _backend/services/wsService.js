@@ -156,7 +156,6 @@ function handleConnection(ws, req) {
 
     ws._msgCount++;
     const rawStr = raw.toString();
-    console.log(`[WS] Raw message #${ws._msgCount} (${rawStr.length} chars, age=${Date.now() - ws._connectedAt}ms): ${rawStr.slice(0, 200)}`);
 
     let msg;
     try {
@@ -166,8 +165,6 @@ function handleConnection(ws, req) {
       ws.send(JSON.stringify({ type: "error", code: "INVALID_JSON", message: "Could not parse JSON" }));
       return;
     }
-
-    console.log(`[WS] Received msg type="${msg.type}" authenticated=${ws.authenticated} (age=${Date.now() - ws._connectedAt}ms)`);
 
 
     try {
@@ -489,9 +486,7 @@ async function handleHttpMessage(ws, msg) {
     return { error: "UNAUTHORIZED" };
   }
 
-  if (msg.type !== "gps_update") {
-    console.log(`[HTTP→WS] Processing type="${msg.type}" mode=${ws.mode}`);
-  }
+  // Logging dilakukan di index.js — tidak perlu duplikat di sini
 
   switch (msg.type) {
     case "nav_start":
