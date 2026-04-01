@@ -95,8 +95,22 @@ class _NavigationScreenState extends State<NavigationScreen> {
     _gpsSub?.cancel();
     _gpsSub = _gps.stream.listen(
       (sample) {
+        debugPrint('[Navigation] GPS tick — lat=${sample.lat} lng=${sample.lng} speed=${sample.speedKmh} | ${DateTime.now().toIso8601String()}');
         if (!mounted) return;
         _lastGps = sample;
+
+        // Auto-trigger nav_start saat GPS pertama kali tersedia & posisinya valid (bukan 0,0)
+        if (!_navStartSent && !_engine.isNavigating && sample.lat != 0.0 && sample.lng != 0.0) {
+          debugPrint('[Navigation] AUTO nav_start dari first GPS — destination=${widget.destination} origin=(${sample.lat},${sample.lng})');
+          _navStartSent = true;
+          _lastNavStartTime = DateTime.now();
+          _ws.sendNavStart(
+            destination: widget.destination,
+            originLat: sample.lat,
+            originLng: sample.lng,
+          );
+        }
+
         _engine.onGpsTick(
           lat: sample.lat,
           lng: sample.lng,
@@ -105,7 +119,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
         );
       },
       onError: (e) {
-        debugPrint('[Chrono] GPS stream error: \$e');
+        debugPrint('[Navigation] GPS stream error: $e');
         _restartGpsIfNeeded();
       },
       onDone: () => _restartGpsIfNeeded(),
@@ -116,6 +130,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
   Future<void> _restartGpsIfNeeded() async {
     if (_restartingGps || !mounted) return;
     _restartingGps = true;
+    debugPrint('[Navigation] _restartGpsIfNeeded triggered');
     try {
       await _gps.start();
       _startGpsStream();
@@ -125,6 +140,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
           (_lastNavStartTime != null &&
               now.difference(_lastNavStartTime!) > const Duration(seconds: 3));
       if (!_engine.isNavigating && sample != null && canResend) {
+        debugPrint('[Navigation] RESTART GPS → kirim nav_start (emergency path) origin=(${sample.lat},${sample.lng})');
         _navStartSent     = true;
         _lastNavStartTime = now;
         _ws.sendNavStart(
@@ -134,7 +150,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
         );
       }
     } catch (e) {
-      debugPrint('[Chrono] GPS restart failed: \$e');
+      debugPrint('[Navigation] GPS restart failed: $e');
     } finally {
       _restartingGps = false;
     }
@@ -149,6 +165,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
       if (route is! Map<String, dynamic>) return;
 
       final polyline = (route['polyline'] ?? '').toString();
+
       final rawSteps = route['steps'];
       final steps = <RouteStep>[];
       if (rawSteps is List) {
@@ -164,6 +181,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
       }
 
       final etaSeconds = (msg['eta_seconds'] as num?)?.toInt() ?? 0;
+
       _engine.startNavigation(
         steps: steps,
         etaMinutes: (etaSeconds / 60).round(),
@@ -225,6 +243,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
             initialLat: _lastGps?.lat,
             initialLng: _lastGps?.lng,
           ),
+
           if (!_gpsActive)
             Positioned(
               top: MediaQuery.of(context).padding.top,
@@ -246,6 +265,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 ),
               ),
             ),
+
           Positioned(
             bottom: 0, left: 0, right: 0,
             child: Container(
@@ -266,14 +286,14 @@ class _NavigationScreenState extends State<NavigationScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '\${_distanceToNext.toStringAsFixed(0)} m',
+                      '${_distanceToNext.toStringAsFixed(0)} m',
                       style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
                     ),
                   ],
                   if (_nextInstruction != null) ...[
                     const SizedBox(height: 8),
                     Text(
-                      'Lalu: \$_nextInstruction',
+                      'Lalu: $_nextInstruction',
                       style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
                     ),
                   ],
@@ -282,7 +302,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
                     children: [
                       Expanded(
                         child: Text(
-                          '\$_status  •  ETA \$_etaMinutes mnt',
+                          '$_status  •  ETA $_etaMinutes mnt',
                           style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
                         ),
                       ),
