@@ -17,14 +17,21 @@
  *   gps_update  : min 800ms
  */
 
-const { timingSafeEqual } = require("crypto");
+const { timingSafeEqual, randomBytes } = require("crypto");
 const { getRoute }        = require("./routeService");
 const { processGpsUpdate } = require("./navService");
 const { synthNavTts }     = require("./ttsService");
 const geminiService       = require("./geminiService");
 const conductor           = require("./conductor");
 
+// ── Session token registry (HTTP→WS bridge) ───────────────────────────────
+// Map<sessionToken, ws>  — digunakan oleh POST /api/send untuk menemukan
+// koneksi WS yang sesuai. Token digenerate saat auth success.
+const sessionRegistry = new Map();
+
 // ── Shared secret [AUTH-A] ────────────────────────────────────────────────
+// Wajib di-set di production. Boleh pakai nilai kSupabaseAnonKey dari Flutter
+// sebagai WS_SHARED_SECRET di Cloud Run env vars agar tidak perlu rebuild app.
 const WS_SHARED_SECRET = (process.env.WS_SHARED_SECRET || "").trim();
 
 const IS_DEV = process.env.NODE_ENV === "development";
@@ -59,6 +66,7 @@ function checkRateLimit(ws, type) {
 
 function extractTokenFromUrl(url) {
   try {
+    // req.url looks like "/?token=xxx" or "/" or "/?token=xxx&other=yyy"
     const urlObj = new URL(url, "http://localhost");
     return (urlObj.searchParams.get("token") || "").trim() || null;
   } catch {
@@ -91,13 +99,16 @@ function handleConnection(ws, req) {
   if (IS_DEV) {
     ws.authenticated = true;
     ws.userId        = "dev";
+    ws._sessionToken = generateSessionToken();
+    sessionRegistry.set(ws._sessionToken, ws);
     console.warn("[WsService] DEV: koneksi baru — bypass aktif");
-    ws.send(JSON.stringify({ type: "auth_ok" }));
+    ws.send(JSON.stringify({ type: "auth_ok", session_token: ws._sessionToken }));
   } else {
     ws.authenticated = false;
     ws.userId        = null;
 
     // [AUTH-URL] Primary auth: token dari URL query parameter
+    // URL format: wss://host/?token=SHARED_SECRET
     const urlToken = extractTokenFromUrl(reqUrl);
     if (urlToken) {
       console.log(`[Auth-URL] Token found in URL (${urlToken.length} chars, starts: "${urlToken.slice(0, 6)}...")`);
@@ -105,8 +116,10 @@ function handleConnection(ws, req) {
       if (valid) {
         ws.authenticated = true;
         ws.userId        = "shared_secret_user";
-        console.log(`[Auth-URL] ✓ authenticated via URL token (took ${Date.now() - ws._connectedAt}ms)`);
-        ws.send(JSON.stringify({ type: "auth_ok" }));
+        ws._sessionToken = generateSessionToken();
+        sessionRegistry.set(ws._sessionToken, ws);
+        console.log(`[Auth-URL] ✓ authenticated — sessionToken=${ws._sessionToken.slice(0, 8)}... (took ${Date.now() - ws._connectedAt}ms)`);
+        ws.send(JSON.stringify({ type: "auth_ok", session_token: ws._sessionToken }));
       } else {
         console.warn(`[Auth-URL] ✗ Token MISMATCH — closing connection`);
         ws.send(JSON.stringify({ type: "auth_error", message: "Token tidak valid" }));
@@ -115,6 +128,7 @@ function handleConnection(ws, req) {
       }
     } else {
       console.log(`[WS] No token in URL — waiting for auth message fallback...`);
+      // Kirim welcome agar Flutter tahu channel siap (fallback flow)
       try {
         ws.send(JSON.stringify({ type: "welcome", ts: Date.now() }));
         console.log(`[WS] Welcome message sent`);
@@ -125,6 +139,7 @@ function handleConnection(ws, req) {
   }
 
   ws.on("message", async (raw) => {
+    // Binary frame (PCM audio — Gemini Live)
     if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer) {
       if (!ws.authenticated) return;
       if (ws.voiceActive && ws.mode === "nav") {
@@ -154,11 +169,12 @@ function handleConnection(ws, req) {
 
     console.log(`[WS] Received msg type="${msg.type}" authenticated=${ws.authenticated} (age=${Date.now() - ws._connectedAt}ms)`);
 
+
     try {
       switch (msg.type) {
         case "auth":
           console.log(`[WS] Auth message received — processing...`);
-          handleAuth(ws, msg);
+          handleAuth(ws, msg);   // sync — tidak ada await, tidak ada network call
           break;
 
         case "ping":
@@ -179,13 +195,16 @@ function handleConnection(ws, req) {
             case "nav_start":
               await startNavigation(ws, msg);
               break;
+
             case "gps_update":
               if (!checkRateLimit(ws, "gps_update")) return;
               await handleGpsUpdateMsg(ws, msg);
               break;
+
             case "nav_stop":
               if (ws.mode === "nav") stopNavigation(ws);
               break;
+
             case "tts_request":
               if (ws.mode !== "nav") return;
               if (!checkRateLimit(ws, "tts_request")) {
@@ -194,6 +213,7 @@ function handleConnection(ws, req) {
               }
               await handleTtsRequest(ws, msg);
               break;
+
             case "voice_start":
               if (ws.mode !== "nav") {
                 ws.send(JSON.stringify({ type: "error", code: "VOICE_NOT_READY", message: "Navigation not active" }));
@@ -201,13 +221,16 @@ function handleConnection(ws, req) {
               }
               await startVoiceStream(ws);
               break;
+
             case "voice_stop":
               ws.voiceActive = false;
               ws.send(JSON.stringify({ type: "voice_stopped" }));
               break;
+
             case "chirp_done":
               if (ws.sessionId) conductor.onChirpEnd(ws.sessionId, ws);
               break;
+
             default:
               ws.send(JSON.stringify({ type: "error", code: "UNKNOWN_TYPE", message: `Unknown type: ${msg.type}` }));
           }
@@ -221,6 +244,7 @@ function handleConnection(ws, req) {
 
   ws.on("close", () => {
     if (ws.trafficTimer) clearInterval(ws.trafficTimer);
+    if (ws._sessionToken) sessionRegistry.delete(ws._sessionToken);
     if (ws.sessionId) {
       geminiService.destroySession(ws.sessionId);
       conductor.destroySession(ws.sessionId);
@@ -229,6 +253,8 @@ function handleConnection(ws, req) {
 }
 
 // ── Auth handler [AUTH-A] ─────────────────────────────────────────────────
+// Sync — tidak ada await, tidak ada network call.
+// auth_ok dikirim dalam <1ms setelah token diterima.
 function handleAuth(ws, msg) {
   console.log(`[Auth] handleAuth called — IS_DEV=${IS_DEV}`);
 
@@ -251,10 +277,13 @@ function handleAuth(ws, msg) {
   console.log(`[Auth] Secret loaded:  ${WS_SHARED_SECRET.length} chars, starts: "${WS_SHARED_SECRET.slice(0, 6)}...", ends: "...${WS_SHARED_SECRET.slice(-4)}"`);
   console.log(`[Auth] Length match: ${token.length === WS_SHARED_SECRET.length}`);
 
+  // timingSafeEqual: mencegah timing attack
+  // Buffer.byteLength agar panjang selalu sama sebelum compare
   let valid = false;
   try {
     const a = Buffer.from(token,            "utf8");
     const b = Buffer.from(WS_SHARED_SECRET, "utf8");
+    // Jika panjang berbeda, langsung reject — timingSafeEqual wajib sama panjang
     valid = a.length === b.length && timingSafeEqual(a, b);
   } catch (err) {
     console.error(`[Auth] timingSafeEqual threw:`, err.message);
@@ -269,12 +298,12 @@ function handleAuth(ws, msg) {
   }
 
   ws.authenticated = true;
-  ws.userId        = "shared_secret_user";
+  ws.userId        = "shared_secret_user";  // diganti real userId saat Opsi B
   console.log(`[Auth] ✓ shared secret — authenticated (took ${Date.now() - ws._connectedAt}ms since connect)`);
   ws.send(JSON.stringify({ type: "auth_ok" }));
 }
 
-// ── Navigation ────────────────────────────────────────────────────────────
+// ── Navigation ──────────────────────────────────────────────────────────
 async function startNavigation(ws, msg) {
   const { destination, dest_lat, dest_lng, origin_lat, origin_lng } = msg;
   const sessionId = `nav_${Date.now().toString(36)}`;
@@ -359,6 +388,7 @@ async function handleGpsUpdateMsg(ws, msg) {
   if (payload) ws.send(JSON.stringify(payload));
 }
 
+// ── TTS on-demand (Model A) ───────────────────────────────────────────────
 async function handleTtsRequest(ws, msg) {
   const text      = (msg.text      || "").trim();
   const requestId = (msg.request_id || "").toString();
@@ -391,6 +421,7 @@ async function handleTtsRequest(ws, msg) {
   }
 }
 
+// ── Gemini Live (Phase 3) ─────────────────────────────────────────────────
 async function startVoiceStream(ws) {
   ws.voiceActive = true;
   ws.send(JSON.stringify({ type: "voice_ready", session_id: ws.sessionId }));
@@ -424,6 +455,7 @@ async function startVoiceStream(ws) {
   });
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────
 function stopNavigation(ws) {
   if (ws.trafficTimer) {
     clearInterval(ws.trafficTimer);
@@ -445,4 +477,63 @@ function refreshTraffic(ws) {
   ws.send(JSON.stringify({ type: "nav_traffic", segments: [] }));
 }
 
-module.exports = { handleConnection };
+function generateSessionToken() {
+  return randomBytes(16).toString("hex");
+}
+
+// ── HTTP→WS bridge ───────────────────────────────────────────────────────
+// Dipanggil dari POST /api/send — route message ke handler yang sama
+// seperti WS message handler.
+async function handleHttpMessage(ws, msg) {
+  if (!ws.authenticated) {
+    return { error: "UNAUTHORIZED" };
+  }
+
+  if (msg.type !== "gps_update") {
+    console.log(`[HTTP→WS] Processing type="${msg.type}" mode=${ws.mode}`);
+  }
+
+  switch (msg.type) {
+    case "nav_start":
+      await startNavigation(ws, msg);
+      return { ok: true, type: "nav_start_accepted" };
+
+    case "gps_update":
+      if (!checkRateLimit(ws, "gps_update")) return { ok: true, throttled: true };
+      await handleGpsUpdateMsg(ws, msg);
+      return { ok: true };
+
+    case "nav_stop":
+      if (ws.mode === "nav") stopNavigation(ws);
+      return { ok: true };
+
+    case "tts_request":
+      if (ws.mode !== "nav") return { ok: true, skipped: true };
+      if (!checkRateLimit(ws, "tts_request")) return { ok: true, throttled: true };
+      await handleTtsRequest(ws, msg);
+      return { ok: true };
+
+    case "voice_start":
+      if (ws.mode !== "nav") return { error: "VOICE_NOT_READY" };
+      await startVoiceStream(ws);
+      return { ok: true };
+
+    case "voice_stop":
+      ws.voiceActive = false;
+      ws.send(JSON.stringify({ type: "voice_stopped" }));
+      return { ok: true };
+
+    case "chirp_done":
+      if (ws.sessionId) conductor.onChirpEnd(ws.sessionId, ws);
+      return { ok: true };
+
+    default:
+      return { error: "UNKNOWN_TYPE", message: `Unknown type: ${msg.type}` };
+  }
+}
+
+function getWsByToken(token) {
+  return sessionRegistry.get(token) || null;
+}
+
+module.exports = { handleConnection, handleHttpMessage, getWsByToken };
